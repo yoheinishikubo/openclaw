@@ -12,6 +12,10 @@ services:
       TS_STATE_DIR: /var/lib/tailscale
       TS_EXTRA_ARGS: --hostname=${TS_HOSTNAME:-openclaw} ${TS_EXTRA_ARGS:-}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+
+      # 追加：serveの宛先
+      TS_SERVE_TARGET: "http://127.0.0.1:18789"
+
     volumes:
       - tailscale-data:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
@@ -21,14 +25,30 @@ services:
       - sys_module
 
     restart: unless-stopped
+
+    # 追加：tailscaled起動→up→serve設定
+    command: >
+      sh -lc "
+        tailscaled --state=${TS_STATE_DIR}/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+        # socketが起きるまで待つ
+        until tailscale status >/dev/null 2>&1; do sleep 0.5; done
+
+        tailscale up --authkey=${TS_AUTHKEY} --hostname=${TS_HOSTNAME:-openclaw} ${TS_EXTRA_ARGS:-}
+
+        # HTTPS(443) => 18789
+        # 既存設定があると競合するので一回クリアしてから入れるのが安全
+        tailscale serve reset || true
+        tailscale serve https / ${TS_SERVE_TARGET}
+
+        # コンテナを生かす
+        tail -f /dev/null
+      "
+
   openclaw-gateway:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
-
     network_mode: "service:tailscale"
-
     depends_on:
       - tailscale
-
     environment:
       HOME: /home/ubuntu
       TERM: xterm-256color
@@ -54,12 +74,9 @@ services:
 
   openclaw-cli:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
-
     network_mode: "service:tailscale"
-
     depends_on:
       - tailscale
-
     environment:
       HOME: /home/ubuntu
       TERM: xterm-256color
