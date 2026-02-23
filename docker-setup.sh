@@ -58,40 +58,11 @@ validate_mount_spec() {
   fi
 }
 
-ensure_ubuntu_user() {
-  if [[ "$(uname -s)" != "Linux" ]]; then
-    return
-  fi
-  if ! command -v groupadd >/dev/null 2>&1 || ! command -v useradd >/dev/null 2>&1; then
-    return
-  fi
-
-  local prefix=""
-  if [[ $(id -u) -ne 0 ]]; then
-    if ! command -v sudo >/dev/null 2>&1; then
-      echo "WARNING: root or sudo required to add ubuntu user/group" >&2
-      return
-    fi
-    prefix="sudo "
-  fi
-
-  if ! getent group ubuntu >/dev/null 2>&1; then
-    echo "==> Creating ubuntu group (GID 1001)"
-    ${prefix}groupadd -g 1001 ubuntu
-  fi
-  if ! id -u ubuntu >/dev/null 2>&1; then
-    echo "==> Creating ubuntu user (UID 1001)"
-    ${prefix}useradd -u 1001 -g 1001 -m -s /bin/bash ubuntu
-  fi
-}
-
 require_cmd docker
 if ! docker compose version >/dev/null 2>&1; then
   echo "Docker Compose not available (try: docker compose version)" >&2
   exit 1
 fi
-
-ensure_ubuntu_user
 
 OPENCLAW_CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 OPENCLAW_WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
@@ -153,9 +124,9 @@ services:
 YAML
 
   if [[ -n "$home_volume" ]]; then
-    gateway_home_mount="${home_volume}:/home/ubuntu"
-    gateway_config_mount="${OPENCLAW_CONFIG_DIR}:/home/ubuntu/.openclaw"
-    gateway_workspace_mount="${OPENCLAW_WORKSPACE_DIR}:/home/ubuntu/.openclaw/workspace"
+    gateway_home_mount="${home_volume}:/home/node"
+    gateway_config_mount="${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw"
+    gateway_workspace_mount="${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace"
     validate_mount_spec "$gateway_home_mount"
     validate_mount_spec "$gateway_config_mount"
     validate_mount_spec "$gateway_workspace_mount"

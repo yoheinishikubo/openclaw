@@ -10,7 +10,8 @@ RUN corepack enable
 RUN groupadd -g 1001 ubuntu && useradd -u 1001 -g 1001 -m -s /bin/bash ubuntu
 
 WORKDIR /app
-RUN chown node:node /app
+# Allow non-root user to write temp files during runtime/tests.
+RUN chown -R ubuntu:ubuntu /app
 
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
 RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
@@ -54,8 +55,7 @@ RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
-# Allow non-root user to write temp files during runtime/tests.
-RUN chown -R ubuntu:ubuntu /app
+
 
 # Security hardening: Run as non-root user
 USER ubuntu
