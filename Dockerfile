@@ -21,12 +21,12 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
   fi
 
-COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-COPY --chown=node:node ui/package.json ./ui/package.json
-COPY --chown=node:node patches ./patches
-COPY --chown=node:node scripts ./scripts
+COPY --chown=ubuntu:ubuntu package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY --chown=ubuntu:ubuntu ui/package.json ./ui/package.json
+COPY --chown=ubuntu:ubuntu patches ./patches
+COPY --chown=ubuntu:ubuntu scripts ./scripts
 
-USER node
+USER ubuntu
 RUN pnpm install --frozen-lockfile
 
 # Optionally install Chromium and Xvfb for browser automation.
@@ -38,16 +38,16 @@ ARG OPENCLAW_INSTALL_BROWSER=""
 RUN if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
   apt-get update && \
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
-  mkdir -p /home/node/.cache/ms-playwright && \
-  PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright \
+  mkdir -p /home/ubuntu/.cache/ms-playwright && \
+  PLAYWRIGHT_BROWSERS_PATH=/home/ubuntu/.cache/ms-playwright \
   node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
-  chown -R node:node /home/node/.cache/ms-playwright && \
+  chown -R ubuntu:ubuntu /home/ubuntu/.cache/ms-playwright && \
   apt-get clean && \
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
   fi
 
-USER node
-COPY --chown=node:node . .
+USER ubuntu
+COPY --chown=ubuntu:ubuntu . .
 RUN pnpm build
 # Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
