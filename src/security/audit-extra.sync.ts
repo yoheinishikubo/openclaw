@@ -1,21 +1,27 @@
+import { isToolAllowedByPolicies } from "../agents/pi-tools.policy.js";
+import {
+  resolveSandboxConfigForAgent,
+  resolveSandboxToolPolicyForAgent,
+} from "../agents/sandbox.js";
 /**
  * Synchronous security audit collector functions.
  *
  * These functions analyze config-based security properties without I/O.
  */
 import type { SandboxToolPolicy } from "../agents/sandbox/types.js";
-import type { OpenClawConfig } from "../config/config.js";
-import type { AgentToolsConfig } from "../config/types.tools.js";
-import { isToolAllowedByPolicies } from "../agents/pi-tools.policy.js";
-import {
-  resolveSandboxConfigForAgent,
-  resolveSandboxToolPolicyForAgent,
-} from "../agents/sandbox.js";
+import { getBlockedBindReason } from "../agents/sandbox/validate-sandbox-security.js";
 import { resolveToolProfilePolicy } from "../agents/tool-policy.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import { formatCliCommand } from "../cli/command-format.js";
+import type { OpenClawConfig } from "../config/config.js";
+import type { AgentToolsConfig } from "../config/types.tools.js";
 import { resolveGatewayAuth } from "../gateway/auth.js";
-import { resolveNodeCommandAllowlist } from "../gateway/node-command-policy.js";
+import {
+  DEFAULT_DANGEROUS_NODE_COMMANDS,
+  resolveNodeCommandAllowlist,
+} from "../gateway/node-command-policy.js";
+import { inferParamBFromIdOrName } from "../shared/model-param-b.js";
+import { pickSandboxToolPolicy } from "./audit-tool-policy.js";
 
 export type SecurityAuditFinding = {
   checkId: string;
@@ -142,26 +148,6 @@ const WEAK_TIER_MODEL_PATTERNS: Array<{ id: string; re: RegExp; label: string }>
   { id: "anthropic.haiku", re: /\bhaiku\b/i, label: "Haiku tier (smaller model)" },
 ];
 
-function inferParamBFromIdOrName(text: string): number | null {
-  const raw = text.toLowerCase();
-  const matches = raw.matchAll(/(?:^|[^a-z0-9])[a-z]?(\d+(?:\.\d+)?)b(?:[^a-z0-9]|$)/g);
-  let best: number | null = null;
-  for (const match of matches) {
-    const numRaw = match[1];
-    if (!numRaw) {
-      continue;
-    }
-    const value = Number(numRaw);
-    if (!Number.isFinite(value) || value <= 0) {
-      continue;
-    }
-    if (best === null || value > best) {
-      best = value;
-    }
-  }
-  return best;
-}
-
 function isGptModel(id: string): boolean {
   return /\bgpt-/i.test(id);
 }
@@ -184,36 +170,6 @@ function isClaude45OrHigher(id: string): boolean {
 function extractAgentIdFromSource(source: string): string | null {
   const match = source.match(/^agents\.list\.([^.]*)\./);
   return match?.[1] ?? null;
-}
-
-function unionAllow(base?: string[], extra?: string[]): string[] | undefined {
-  if (!Array.isArray(extra) || extra.length === 0) {
-    return base;
-  }
-  if (!Array.isArray(base) || base.length === 0) {
-    return Array.from(new Set(["*", ...extra]));
-  }
-  return Array.from(new Set([...base, ...extra]));
-}
-
-function pickToolPolicy(config?: {
-  allow?: string[];
-  alsoAllow?: string[];
-  deny?: string[];
-}): SandboxToolPolicy | null {
-  if (!config) {
-    return null;
-  }
-  const allow = Array.isArray(config.allow)
-    ? unionAllow(config.allow, config.alsoAllow)
-    : Array.isArray(config.alsoAllow) && config.alsoAllow.length > 0
-      ? unionAllow(undefined, config.alsoAllow)
-      : undefined;
-  const deny = Array.isArray(config.deny) ? config.deny : undefined;
-  if (!allow && !deny) {
-    return null;
-  }
-  return { allow, deny };
 }
 
 function hasConfiguredDockerConfig(
@@ -284,12 +240,12 @@ function resolveToolPolicies(params: {
     policies.push(profilePolicy);
   }
 
-  const globalPolicy = pickToolPolicy(params.cfg.tools ?? undefined);
+  const globalPolicy = pickSandboxToolPolicy(params.cfg.tools ?? undefined);
   if (globalPolicy) {
     policies.push(globalPolicy);
   }
 
-  const agentPolicy = pickToolPolicy(params.agentTools);
+  const agentPolicy = pickSandboxToolPolicy(params.agentTools);
   if (agentPolicy) {
     policies.push(agentPolicy);
   }
@@ -488,7 +444,7 @@ export function collectHooksHardeningFindings(
   if (token && gatewayToken && token === gatewayToken) {
     findings.push({
       checkId: "hooks.token_reuse_gateway_token",
-      severity: "warn",
+      severity: "critical",
       title: "Hooks token reuses the Gateway token",
       detail:
         "hooks.token matches gateway.auth token; compromise of hooks expands blast radius to the Gateway API.",
@@ -582,6 +538,40 @@ export function collectGatewayHttpSessionKeyOverrideFindings(
   return findings;
 }
 
+export function collectGatewayHttpNoAuthFindings(
+  cfg: OpenClawConfig,
+  env: NodeJS.ProcessEnv,
+): SecurityAuditFinding[] {
+  const findings: SecurityAuditFinding[] = [];
+  const tailscaleMode = cfg.gateway?.tailscale?.mode ?? "off";
+  const auth = resolveGatewayAuth({ authConfig: cfg.gateway?.auth, tailscaleMode, env });
+  if (auth.mode !== "none") {
+    return findings;
+  }
+
+  const chatCompletionsEnabled = cfg.gateway?.http?.endpoints?.chatCompletions?.enabled === true;
+  const responsesEnabled = cfg.gateway?.http?.endpoints?.responses?.enabled === true;
+  const enabledEndpoints = [
+    "/tools/invoke",
+    chatCompletionsEnabled ? "/v1/chat/completions" : null,
+    responsesEnabled ? "/v1/responses" : null,
+  ].filter((entry): entry is string => Boolean(entry));
+
+  const remoteExposure = isGatewayRemotelyExposed(cfg);
+  findings.push({
+    checkId: "gateway.http.no_auth",
+    severity: remoteExposure ? "critical" : "warn",
+    title: "Gateway HTTP APIs are reachable without auth",
+    detail:
+      `gateway.auth.mode="none" leaves ${enabledEndpoints.join(", ")} callable without a shared secret. ` +
+      "Treat this as trusted-local only and avoid exposing the gateway beyond loopback.",
+    remediation:
+      "Set gateway.auth.mode to token/password (recommended). If you intentionally keep mode=none, keep gateway.bind=loopback and disable optional HTTP endpoints.",
+  });
+
+  return findings;
+}
+
 export function collectSandboxDockerNoopFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
   const configuredPaths: string[] = [];
@@ -632,6 +622,143 @@ export function collectSandboxDockerNoopFindings(cfg: OpenClawConfig): SecurityA
   return findings;
 }
 
+export function collectSandboxDangerousConfigFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
+  const findings: SecurityAuditFinding[] = [];
+  const agents = Array.isArray(cfg.agents?.list) ? cfg.agents.list : [];
+
+  const configs: Array<{ source: string; docker: Record<string, unknown> }> = [];
+  const defaultDocker = cfg.agents?.defaults?.sandbox?.docker;
+  if (defaultDocker && typeof defaultDocker === "object") {
+    configs.push({
+      source: "agents.defaults.sandbox.docker",
+      docker: defaultDocker as Record<string, unknown>,
+    });
+  }
+  for (const entry of agents) {
+    if (!entry || typeof entry !== "object" || typeof entry.id !== "string") {
+      continue;
+    }
+    const agentDocker = entry.sandbox?.docker;
+    if (agentDocker && typeof agentDocker === "object") {
+      configs.push({
+        source: `agents.list.${entry.id}.sandbox.docker`,
+        docker: agentDocker as Record<string, unknown>,
+      });
+    }
+  }
+
+  for (const { source, docker } of configs) {
+    const binds = Array.isArray(docker.binds) ? docker.binds : [];
+    for (const bind of binds) {
+      if (typeof bind !== "string") {
+        continue;
+      }
+      const blocked = getBlockedBindReason(bind);
+      if (!blocked) {
+        continue;
+      }
+      if (blocked.kind === "non_absolute") {
+        findings.push({
+          checkId: "sandbox.bind_mount_non_absolute",
+          severity: "warn",
+          title: "Sandbox bind mount uses a non-absolute source path",
+          detail:
+            `${source}.binds contains "${bind}" which uses source path "${blocked.sourcePath}". ` +
+            "Non-absolute bind sources are hard to validate safely and may resolve unexpectedly.",
+          remediation: `Rewrite "${bind}" to use an absolute host path (for example: /home/user/project:/project:ro).`,
+        });
+        continue;
+      }
+      const verb = blocked.kind === "covers" ? "covers" : "targets";
+      findings.push({
+        checkId: "sandbox.dangerous_bind_mount",
+        severity: "critical",
+        title: "Dangerous bind mount in sandbox config",
+        detail:
+          `${source}.binds contains "${bind}" which ${verb} blocked path "${blocked.blockedPath}". ` +
+          "This can expose host system directories or the Docker socket to sandbox containers.",
+        remediation: `Remove "${bind}" from ${source}.binds. Use project-specific paths instead.`,
+      });
+    }
+
+    const network = typeof docker.network === "string" ? docker.network : undefined;
+    if (network && network.trim().toLowerCase() === "host") {
+      findings.push({
+        checkId: "sandbox.dangerous_network_mode",
+        severity: "critical",
+        title: "Network host mode in sandbox config",
+        detail: `${source}.network is "host" which bypasses container network isolation entirely.`,
+        remediation: `Set ${source}.network to "bridge" or "none".`,
+      });
+    }
+
+    const seccompProfile =
+      typeof docker.seccompProfile === "string" ? docker.seccompProfile : undefined;
+    if (seccompProfile && seccompProfile.trim().toLowerCase() === "unconfined") {
+      findings.push({
+        checkId: "sandbox.dangerous_seccomp_profile",
+        severity: "critical",
+        title: "Seccomp unconfined in sandbox config",
+        detail: `${source}.seccompProfile is "unconfined" which disables syscall filtering.`,
+        remediation: `Remove ${source}.seccompProfile or use a custom seccomp profile file.`,
+      });
+    }
+
+    const apparmorProfile =
+      typeof docker.apparmorProfile === "string" ? docker.apparmorProfile : undefined;
+    if (apparmorProfile && apparmorProfile.trim().toLowerCase() === "unconfined") {
+      findings.push({
+        checkId: "sandbox.dangerous_apparmor_profile",
+        severity: "critical",
+        title: "AppArmor unconfined in sandbox config",
+        detail: `${source}.apparmorProfile is "unconfined" which disables AppArmor enforcement.`,
+        remediation: `Remove ${source}.apparmorProfile or use a named AppArmor profile.`,
+      });
+    }
+  }
+
+  const browserExposurePaths: string[] = [];
+  const defaultBrowser = resolveSandboxConfigForAgent(cfg).browser;
+  if (
+    defaultBrowser.enabled &&
+    defaultBrowser.network.trim().toLowerCase() === "bridge" &&
+    !defaultBrowser.cdpSourceRange?.trim()
+  ) {
+    browserExposurePaths.push("agents.defaults.sandbox.browser");
+  }
+  for (const entry of agents) {
+    if (!entry || typeof entry !== "object" || typeof entry.id !== "string") {
+      continue;
+    }
+    const browser = resolveSandboxConfigForAgent(cfg, entry.id).browser;
+    if (!browser.enabled) {
+      continue;
+    }
+    if (browser.network.trim().toLowerCase() !== "bridge") {
+      continue;
+    }
+    if (browser.cdpSourceRange?.trim()) {
+      continue;
+    }
+    browserExposurePaths.push(`agents.list.${entry.id}.sandbox.browser`);
+  }
+  if (browserExposurePaths.length > 0) {
+    findings.push({
+      checkId: "sandbox.browser_cdp_bridge_unrestricted",
+      severity: "warn",
+      title: "Sandbox browser CDP may be reachable by peer containers",
+      detail:
+        "These sandbox browser configs use Docker bridge networking with no CDP source restriction:\n" +
+        browserExposurePaths.map((entry) => `- ${entry}`).join("\n"),
+      remediation:
+        "Set sandbox.browser.network to a dedicated bridge network (recommended default: openclaw-sandbox-browser), " +
+        "or set sandbox.browser.cdpSourceRange (for example 172.21.0.1/32) to restrict container-edge CDP ingress.",
+    });
+  }
+
+  return findings;
+}
+
 export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
   const denyListRaw = cfg.gateway?.nodes?.denyCommands;
@@ -676,6 +803,43 @@ export function collectNodeDenyCommandPatternFindings(cfg: OpenClawConfig): Secu
     remediation:
       `Use exact command names (for example: ${examples.join(", ")}). ` +
       "If you need broader restrictions, remove risky commands from allowCommands/default workflows.",
+  });
+
+  return findings;
+}
+
+export function collectNodeDangerousAllowCommandFindings(
+  cfg: OpenClawConfig,
+): SecurityAuditFinding[] {
+  const findings: SecurityAuditFinding[] = [];
+  const allowRaw = cfg.gateway?.nodes?.allowCommands;
+  if (!Array.isArray(allowRaw) || allowRaw.length === 0) {
+    return findings;
+  }
+
+  const allow = new Set(allowRaw.map(normalizeNodeCommand).filter(Boolean));
+  if (allow.size === 0) {
+    return findings;
+  }
+
+  const deny = new Set((cfg.gateway?.nodes?.denyCommands ?? []).map(normalizeNodeCommand));
+  const dangerousAllowed = DEFAULT_DANGEROUS_NODE_COMMANDS.filter(
+    (cmd) => allow.has(cmd) && !deny.has(cmd),
+  );
+  if (dangerousAllowed.length === 0) {
+    return findings;
+  }
+
+  findings.push({
+    checkId: "gateway.nodes.allow_commands_dangerous",
+    severity: isGatewayRemotelyExposed(cfg) ? "critical" : "warn",
+    title: "Dangerous node commands explicitly enabled",
+    detail:
+      `gateway.nodes.allowCommands includes: ${dangerousAllowed.join(", ")}. ` +
+      "These commands can trigger high-impact device actions (camera/screen/contacts/calendar/reminders/SMS).",
+    remediation:
+      "Remove these entries from gateway.nodes.allowCommands (recommended). " +
+      "If you keep them, treat gateway auth as full operator access and keep gateway exposure local/tailnet-only.",
   });
 
   return findings;
@@ -914,6 +1078,68 @@ export function collectExposureMatrixFindings(cfg: OpenClawConfig): SecurityAudi
         `Found groupPolicy="open" at:\n${openGroups.map((p) => `- ${p}`).join("\n")}\n` +
         "With tools.elevated enabled, a prompt injection in those rooms can become a high-impact incident.",
       remediation: `Set groupPolicy="allowlist" and keep elevated allowlists extremely tight.`,
+    });
+  }
+
+  const contexts: Array<{
+    label: string;
+    agentId?: string;
+    tools?: AgentToolsConfig;
+  }> = [{ label: "agents.defaults" }];
+  for (const agent of cfg.agents?.list ?? []) {
+    if (!agent || typeof agent !== "object" || typeof agent.id !== "string") {
+      continue;
+    }
+    contexts.push({
+      label: `agents.list.${agent.id}`,
+      agentId: agent.id,
+      tools: agent.tools,
+    });
+  }
+
+  const riskyContexts: string[] = [];
+  let hasRuntimeRisk = false;
+  for (const context of contexts) {
+    const sandboxMode = resolveSandboxConfigForAgent(cfg, context.agentId).mode;
+    const policies = resolveToolPolicies({
+      cfg,
+      agentTools: context.tools,
+      sandboxMode,
+      agentId: context.agentId ?? null,
+    });
+    const runtimeTools = ["exec", "process"].filter((tool) =>
+      isToolAllowedByPolicies(tool, policies),
+    );
+    const fsTools = ["read", "write", "edit", "apply_patch"].filter((tool) =>
+      isToolAllowedByPolicies(tool, policies),
+    );
+    const fsWorkspaceOnly = context.tools?.fs?.workspaceOnly ?? cfg.tools?.fs?.workspaceOnly;
+    const runtimeUnguarded = runtimeTools.length > 0 && sandboxMode !== "all";
+    const fsUnguarded = fsTools.length > 0 && sandboxMode !== "all" && fsWorkspaceOnly !== true;
+    if (!runtimeUnguarded && !fsUnguarded) {
+      continue;
+    }
+    if (runtimeUnguarded) {
+      hasRuntimeRisk = true;
+    }
+    riskyContexts.push(
+      `${context.label} (sandbox=${sandboxMode}; runtime=[${runtimeTools.join(", ") || "off"}]; fs=[${fsTools.join(", ") || "off"}]; fs.workspaceOnly=${
+        fsWorkspaceOnly === true ? "true" : "false"
+      })`,
+    );
+  }
+
+  if (riskyContexts.length > 0) {
+    findings.push({
+      checkId: "security.exposure.open_groups_with_runtime_or_fs",
+      severity: hasRuntimeRisk ? "critical" : "warn",
+      title: "Open groupPolicy with runtime/filesystem tools exposed",
+      detail:
+        `Found groupPolicy="open" at:\n${openGroups.map((p) => `- ${p}`).join("\n")}\n` +
+        `Risky tool exposure contexts:\n${riskyContexts.map((line) => `- ${line}`).join("\n")}\n` +
+        "Prompt injection in open groups can trigger command/file actions in these contexts.",
+      remediation:
+        'For open groups, prefer tools.profile="messaging" (or deny group:runtime/group:fs), set tools.fs.workspaceOnly=true, and use agents.defaults.sandbox.mode="all" for exposed agents.',
     });
   }
 

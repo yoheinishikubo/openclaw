@@ -1,12 +1,19 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { OpenClawConfig } from "../../config/config.js";
-import type { FailoverReason } from "./types.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { formatSandboxToolPolicyBlockedMessage } from "../sandbox.js";
+import { stableStringify } from "../stable-stringify.js";
+import type { FailoverReason } from "./types.js";
 
-export function formatBillingErrorMessage(provider?: string): string {
+const log = createSubsystemLogger("errors");
+
+export function formatBillingErrorMessage(provider?: string, model?: string): string {
   const providerName = provider?.trim();
-  if (providerName) {
-    return `⚠️ ${providerName} returned a billing error — your API key has run out of credits or has an insufficient balance. Check your ${providerName} billing dashboard and top up or switch to a different API key.`;
+  const modelName = model?.trim();
+  const providerLabel =
+    providerName && modelName ? `${providerName} (${modelName})` : providerName || undefined;
+  if (providerLabel) {
+    return `⚠️ ${providerLabel} returned a billing error — your API key has run out of credits or has an insufficient balance. Check your ${providerName} billing dashboard and top up or switch to a different API key.`;
   }
   return "⚠️ API provider returned a billing error — your API key has run out of credits or has an insufficient balance. Check your provider's billing dashboard and top up or switch to a different API key.";
 }
@@ -107,6 +114,8 @@ const ERROR_PREFIX_RE =
   /^(?:error|api\s*error|openai\s*error|anthropic\s*error|gateway\s*error|request failed|failed|exception)[:\s-]+/i;
 const CONTEXT_OVERFLOW_ERROR_HEAD_RE =
   /^(?:context overflow:|request_too_large\b|request size exceeds\b|request exceeds the maximum size\b|context length exceeded\b|maximum context length\b|prompt is too long\b|exceeds model context window\b)/i;
+const BILLING_ERROR_HEAD_RE =
+  /^(?:error[:\s-]+)?billing(?:\s+error)?(?:[:\s-]+|$)|^(?:error[:\s-]+)?(?:credit balance|insufficient credits?|payment required|http\s*402\b)/i;
 const HTTP_STATUS_PREFIX_RE = /^(?:http\s*)?(\d{3})\s+(.+)$/i;
 const HTTP_STATUS_CODE_PREFIX_RE = /^(?:http\s*)?(\d{3})(?:\s+([\s\S]+))?$/i;
 const HTML_ERROR_PREFIX_RE = /^\s*(?:<!doctype\s+html\b|<html\b)/i;
@@ -295,19 +304,6 @@ function parseApiErrorPayload(raw: string): ErrorPayload | null {
   return null;
 }
 
-function stableStringify(value: unknown): string {
-  if (!value || typeof value !== "object") {
-    return JSON.stringify(value) ?? "null";
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
-  }
-  const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).toSorted();
-  const entries = keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`);
-  return `{${entries.join(",")}}`;
-}
-
 export function getApiErrorPayloadFingerprint(raw?: string): string | null {
   if (!raw) {
     return null;
@@ -418,7 +414,7 @@ export function formatRawAssistantErrorForUi(raw?: string): string {
 
 export function formatAssistantErrorText(
   msg: AssistantMessage,
-  opts?: { cfg?: OpenClawConfig; sessionKey?: string; provider?: string },
+  opts?: { cfg?: OpenClawConfig; sessionKey?: string; provider?: string; model?: string },
 ): string | undefined {
   // Also format errors if errorMessage is present, even if stopReason isn't "error"
   const raw = (msg.errorMessage ?? "").trim();
@@ -485,7 +481,7 @@ export function formatAssistantErrorText(
   }
 
   if (isBillingErrorMessage(raw)) {
-    return formatBillingErrorMessage(opts?.provider);
+    return formatBillingErrorMessage(opts?.provider, opts?.model ?? msg.model);
   }
 
   if (isLikelyHttpErrorText(raw) || isRawApiErrorPayload(raw)) {
@@ -494,7 +490,7 @@ export function formatAssistantErrorText(
 
   // Never return raw unhandled errors - log for debugging but return safe message
   if (raw.length > 600) {
-    console.warn("[formatAssistantErrorText] Long error truncated:", raw.slice(0, 200));
+    log.warn(`Long error truncated: ${raw.slice(0, 200)}`);
   }
   return raw.length > 600 ? `${raw.slice(0, 600)}…` : raw;
 }
@@ -571,13 +567,21 @@ const ERROR_PATTERNS = {
     "resource_exhausted",
     "usage limit",
   ],
-  overloaded: [/overloaded_error|"type"\s*:\s*"overloaded_error"/i, "overloaded"],
+  overloaded: [
+    /overloaded_error|"type"\s*:\s*"overloaded_error"/i,
+    "overloaded",
+    "service unavailable",
+    "high demand",
+  ],
   timeout: [
     "timeout",
     "timed out",
     "deadline exceeded",
     "context deadline exceeded",
     /without sending (?:any )?chunks?/i,
+    /\bstop reason:\s*abort\b/i,
+    /\breason:\s*abort\b/i,
+    /\bunhandled stop reason:\s*abort\b/i,
   ],
   billing: [
     /["']?(?:status|code)["']?\s*[:=]\s*402\b|\bhttp\s*402\b|\berror(?:\s+code)?\s*[:=]?\s*402\b|\b(?:got|returned|received)\s+(?:a\s+)?402\b|^\s*402\s+payment/i,
@@ -610,6 +614,7 @@ const ERROR_PATTERNS = {
     "tool_use_id",
     "messages.1.content.1.tool_use.id",
     "invalid request format",
+    /tool call id was.*must be/i,
   ],
 } as const;
 
@@ -646,8 +651,18 @@ export function isBillingErrorMessage(raw: string): boolean {
   if (!value) {
     return false;
   }
-
-  return matchesErrorPatterns(value, ERROR_PATTERNS.billing);
+  if (matchesErrorPatterns(value, ERROR_PATTERNS.billing)) {
+    return true;
+  }
+  if (!BILLING_ERROR_HEAD_RE.test(raw)) {
+    return false;
+  }
+  return (
+    value.includes("upgrade") ||
+    value.includes("credits") ||
+    value.includes("payment") ||
+    value.includes("plan")
+  );
 }
 
 export function isMissingToolCallInputError(raw: string): boolean {
@@ -670,6 +685,16 @@ export function isAuthErrorMessage(raw: string): boolean {
 
 export function isOverloadedErrorMessage(raw: string): boolean {
   return matchesErrorPatterns(raw, ERROR_PATTERNS.overloaded);
+}
+
+function isJsonApiInternalServerError(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  const value = raw.toLowerCase();
+  // Anthropic often wraps transient 500s in JSON payloads like:
+  // {"type":"error","error":{"type":"api_error","message":"Internal server error"}}
+  return value.includes('"type":"api_error"') && value.includes("internal server error");
 }
 
 export function parseImageDimensionError(raw: string): {
@@ -735,6 +760,37 @@ export function isAuthAssistantError(msg: AssistantMessage | undefined): boolean
   return isAuthErrorMessage(msg.errorMessage ?? "");
 }
 
+export function isModelNotFoundErrorMessage(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  const lower = raw.toLowerCase();
+
+  // Direct pattern matches from OpenClaw internals and common providers.
+  if (
+    lower.includes("unknown model") ||
+    lower.includes("model not found") ||
+    lower.includes("model_not_found") ||
+    lower.includes("not_found_error") ||
+    (lower.includes("does not exist") && lower.includes("model")) ||
+    (lower.includes("invalid model") && !lower.includes("invalid model reference"))
+  ) {
+    return true;
+  }
+
+  // Google Gemini: "models/X is not found for api version"
+  if (/models\/[^\s]+ is not found/i.test(raw)) {
+    return true;
+  }
+
+  // JSON error payloads: {"status": "NOT_FOUND"} or {"code": 404} combined with not-found text.
+  if (/\b404\b/.test(raw) && /not[-_ ]?found/i.test(raw)) {
+    return true;
+  }
+
+  return false;
+}
+
 export function classifyFailoverReason(raw: string): FailoverReason | null {
   if (isImageDimensionErrorMessage(raw)) {
     return null;
@@ -742,8 +798,14 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
   if (isImageSizeError(raw)) {
     return null;
   }
+  if (isModelNotFoundErrorMessage(raw)) {
+    return "model_not_found";
+  }
   if (isTransientHttpError(raw)) {
     // Treat transient 5xx provider failures as retryable transport issues.
+    return "timeout";
+  }
+  if (isJsonApiInternalServerError(raw)) {
     return "timeout";
   }
   if (isRateLimitErrorMessage(raw)) {
