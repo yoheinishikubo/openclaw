@@ -30,8 +30,7 @@ RUN set -eux; \
   *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
   esac; \
   download_url=$(curl -fsSL https://api.github.com/repos/steipete/gogcli/releases/latest \
-  | python3 -c 'import json,sys; urls=[a.get("browser_download_url","") for a in json.load(sys.stdin).get("assets",[]) if sys.argv[1] in a.get("name","") and a.get("name",""
-  ).endswith(".tar.gz")]; print(urls[0]) if urls else sys.exit(1)' "$suffix"); \
+  | python3 -c 'import json,sys; urls=[a.get("browser_download_url","") for a in json.load(sys.stdin).get("assets",[]) if sys.argv[1] in a.get("name","") and a.get("name","").endswith(".tar.gz")]; print(urls[0]) if urls else sys.exit(1)' "$suffix"); \
   curl -fsSL "$download_url" -o /tmp/gog.tgz; \
   tar -xzf /tmp/gog.tgz -C /tmp gog; \
   mv /tmp/gog /usr/local/bin/gog; \
