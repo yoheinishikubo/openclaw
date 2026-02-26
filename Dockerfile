@@ -21,6 +21,37 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
   fi
 
+# Google Workspace CLI needed for gog-based skills (Gmail watch, etc.)
+RUN set -eux; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in \
+    amd64) suffix=linux_amd64 ;; \
+    arm64) suffix=linux_arm64 ;; \
+    *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+  esac; \
+  download_url=$(curl -fsSL https://api.github.com/repos/steipete/gogcli/releases/latest \
+    | python3 - \
+      "$suffix" \
+      <<'PY'
+import json
+import sys
+
+suffix = sys.argv[1]
+data = json.load(sys.stdin)
+for asset in data.get("assets", []):
+    name = asset.get("name", "")
+    if suffix in name and name.endswith(".tar.gz"):
+        print(asset.get("browser_download_url", ""))
+        sys.exit(0)
+sys.exit(1)
+PY
+  ); \
+  curl -fsSL "$download_url" -o /tmp/gog.tgz; \
+  tar -xzf /tmp/gog.tgz -C /tmp gog; \
+  mv /tmp/gog /usr/local/bin/gog; \
+  chmod +x /usr/local/bin/gog; \
+  rm /tmp/gog.tgz
+
 COPY --chown=ubuntu:ubuntu package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY --chown=ubuntu:ubuntu ui/package.json ./ui/package.json
 COPY --chown=ubuntu:ubuntu patches ./patches
