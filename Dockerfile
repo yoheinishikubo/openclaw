@@ -1,8 +1,7 @@
 FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935
 
 # Install Bun (required for build scripts)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
 
 RUN corepack enable
 
@@ -25,27 +24,12 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
 RUN set -eux; \
   arch="$(dpkg --print-architecture)"; \
   case "$arch" in \
-    amd64) suffix=linux_amd64 ;; \
-    arm64) suffix=linux_arm64 ;; \
-    *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+  amd64) suffix=linux_amd64 ;; \
+  arm64) suffix=linux_arm64 ;; \
+  *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
   esac; \
   download_url=$(curl -fsSL https://api.github.com/repos/steipete/gogcli/releases/latest \
-    | python3 - \
-      "$suffix" \
-      <<'PY'
-import json
-import sys
-
-suffix = sys.argv[1]
-data = json.load(sys.stdin)
-for asset in data.get("assets", []):
-    name = asset.get("name", "")
-    if suffix in name and name.endswith(".tar.gz"):
-        print(asset.get("browser_download_url", ""))
-        sys.exit(0)
-sys.exit(1)
-PY
-  ); \
+  | python3 -c 'import json,sys; urls=[a.get("browser_download_url","") for a in json.load(sys.stdin).get("assets",[]) if sys.argv[1] in a.get("name","") and a.get("name","").endswith(".tar.gz")]; print(urls[0]) if urls else sys.exit(1)' "$suffix"); \
   curl -fsSL "$download_url" -o /tmp/gog.tgz; \
   tar -xzf /tmp/gog.tgz -C /tmp gog; \
   mv /tmp/gog /usr/local/bin/gog; \
