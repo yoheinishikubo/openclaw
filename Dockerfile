@@ -55,7 +55,7 @@ USER root
 ARG OPENCLAW_INSTALL_BROWSER=""
 RUN if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
   apt-get update && \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb chromium socat && \
   mkdir -p /home/ubuntu/.cache/ms-playwright && \
   PLAYWRIGHT_BROWSERS_PATH=/home/ubuntu/.cache/ms-playwright \
   node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
